@@ -34,6 +34,11 @@ class Engine:
         self.weights = extract_model_weights(weight_manager.weight_map, self.layers)
         
         self.kv_cache = {}
+
+    def rms_norm(self, x, weight, eps=1e-5):
+        variance = x.pow(2).mean(-1, keepdim=True)
+        hidden_states = x * torch.rsqrt(variance + eps)
+        return weight * hidden_states
     
     def _apply_rope_batched(self, x, head_dim, offset=0):
         # x: [batch_size, seq_len, hidden_dim]
