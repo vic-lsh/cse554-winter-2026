@@ -1,10 +1,8 @@
 import sys
 
 import torch
-from transformers import AutoTokenizer
-
-sys.path.append("../")  # Adjust the path to import the helper module
 from helper import WeightManager, apply_rope, extract_model_weights
+from transformers import AutoTokenizer
 
 
 class Engine:
