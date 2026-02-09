@@ -12,3 +12,4 @@ trace.json
 
 __pycache__
 .env
+*.png
