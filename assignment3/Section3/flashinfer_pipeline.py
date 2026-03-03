@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import flashinfer
@@ -131,10 +132,12 @@ def build_kv_metadata(kvs: List[DistKVCache]):
     kv_last_page_len: List[int] = []
 
     for kv in kvs:
-        pass
         #########
         # FIXME #
         #########
+        kv_indptr.append(kv_indptr[-1] + len(kv.indices))
+        kv_indices.extend(kv.indices)
+        kv_last_page_len.append(kv.last_page_offset)
 
     device = "cuda"
     return (
@@ -213,11 +216,17 @@ class Engine:
         )
         self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             self._fi_workspace, "HND", use_tensor_cores=True)
+        self.last_run_breakdown: Dict[str, float] = {}
 
     # ---------------------------------------------------------------------
     #  One *step* (mixed prefill + decode) over an *arbitrary* request batch
     # ---------------------------------------------------------------------
-    def run(self, requests: List[Request], num_decode_req: int = 0):
+    def run(
+        self,
+        requests: List[Request],
+        num_decode_req: int = 0,
+        enable_timing: bool = False,
+    ):
         """Run *one* transformer step for ``requests``.
 
         Parameters
@@ -228,6 +237,27 @@ class Engine:
             Number of *decode* requests (the **first** N in *requests*).
             Those will feed only their **last** token; the rest are prefills.
         """
+        stage_times: Dict[str, float] = {}
+        stage_start: Optional[float] = None
+
+        def tic() -> None:
+            '''Start / resume timer for the next stage.'''
+            nonlocal stage_start
+            if enable_timing:
+                torch.cuda.synchronize()
+                stage_start = time.perf_counter()
+
+        def toc(name: str) -> None:
+            '''Stop timer and record elapsed time for *name* stage.'''
+            nonlocal stage_start
+            if enable_timing and stage_start is not None:
+                torch.cuda.synchronize()
+                stage_times[name] = stage_times.get(name, 0.0) + (
+                    (time.perf_counter() - stage_start) * 1000.0
+                )
+                stage_start = None
+
+        tic()
         with torch.inference_mode():
             # ----------------------------------------------------------------
             # 1) Build ragged *input* tensor and its CSR *indptr*
@@ -245,6 +275,7 @@ class Engine:
 
             input_tensor = torch.cat(pieces).to("cuda")
             indptr_tensor = torch.tensor(indptr, dtype=torch.int32, device="cuda")
+            toc("build_input")
 
             # ----------------------------------------------------------------
             # 2) Create KV cache for prefill requests in kv_cache_map
@@ -255,7 +286,16 @@ class Engine:
             #########
                 
             seq_lens_before: List[int] = []
+
+            tic()
+            for r in requests:
+                if r.request_id not in self.kv_cache_map:
+                    self.kv_cache_map[r.request_id] = DistKVCache(self.pool)
+                seq_lens_before.append(self.kv_cache_map[r.request_id].seqlen)
+
             seq_lens_before_t = torch.tensor(seq_lens_before, dtype=torch.int32, device="cuda")
+            toc("prepare_kv_views")
+            
 
             # ----------------------------------------------------------------
             # 3) Reserve allocate pages for all requests if needed using allocate_tokens function
@@ -264,38 +304,78 @@ class Engine:
             #########
             # FIXME #
             #########
-            
-            seq_lens_after = [self.kv_cache_map[r.request_id].seqlen for r in requests]
+
+            tic()
+            for i in range(len(requests)):
+                request = requests[i]
+                if i < num_decode_req:
+                    # decode request - allocate 1 token
+                    self.kv_cache_map[request.request_id].allocate_tokens(1)
+                else:
+                    # prefill request - allocate prompt_length tokens
+                    self.kv_cache_map[request.request_id].allocate_tokens(request.prompt_length)
+
+            seq_lens_after = [self.kv_cache_map[r.request_id].seqlen for r in requests] 
             seq_lens_after_t = torch.tensor(seq_lens_after, dtype=torch.int32, device="cuda")
+            toc("allocate_kv_pages")
+            
 
             # Build paged-KV metadata **after** the append -------------------
+            tic()
             kv_indptr, kv_indices, kv_last_page_len = build_kv_metadata(
                 [self.kv_cache_map[r.request_id] for r in requests]
             )
+            toc("build_kv_metadata")
 
             # ----------------------------------------------------------------
             # 4) Plan FlashInfer execution for batch
             # ----------------------------------------------------------------
+            num_decode_tokens = indptr_tensor[num_decode_req].item()
+
+            tic()
             if not len(requests) - num_decode_req == 0:
-                # plan prefill wrapper
-                pass
-                #########
-                # FIXME #
-                #########
+                # Rebase prefill pointers to start at 0
+                prefill_qo_indptr = indptr_tensor[num_decode_req:] - num_decode_tokens
+                prefill_kv_indptr = kv_indptr[num_decode_req:] - kv_indptr[num_decode_req]
+                
+                prefill_kv_indices = kv_indices[kv_indptr[num_decode_req]:]
+                
+                self.prefill_wrapper.plan(
+                    qo_indptr=prefill_qo_indptr,
+                    paged_kv_indptr=prefill_kv_indptr,
+                    paged_kv_indices=prefill_kv_indices,
+                    paged_kv_last_page_len=kv_last_page_len[num_decode_req:],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim_qk=self.head_dim,
+                    page_size=self.page_size,
+                    causal=True
+                )
+
             if num_decode_req > 0:
-                # plan decode wrapper
-                pass
-                #########
-                # FIXME #
-                #########
+                decode_total_pages = kv_indptr[num_decode_req]
+                self.decode_wrapper.plan(
+                    indptr=kv_indptr[:num_decode_req + 1],
+                    indices=kv_indices[:decode_total_pages],
+                    last_page_len=kv_last_page_len[:num_decode_req],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    page_size=self.page_size,
+                    data_type=torch.float16,
+                )
+            toc("wrapper_plan")
 
             # ----------------------------------------------------------------
             # 5) Forward pass through all *transformer* layers
             # ----------------------------------------------------------------
+            tic()
             hidden = self.weights["embedding"][input_tensor]
+            toc("embedding_lookup")
 
             for layer in range(self.layers):
                 # === Self-attention sub-layer ==================================
+                tic()
                 rms = torch.sqrt(hidden.square().mean(-1, keepdim=True) + 1e-5)
                 ln_attn_in = (hidden / rms).to(torch.float16) * self.weights["layernormAttn_weight"][layer]
 
@@ -314,6 +394,7 @@ class Engine:
                     .matmul(self.weights["self_attn_q_proj_weight"][layer].T)
                     .view(-1, self.num_qo_heads, self.head_dim)
                 )
+                toc("attn_qkv_proj")
 
                 # ---- Rotary positional embedding ---------------------------
                 # Use flashinfer.apply_rope_inplace
@@ -323,6 +404,17 @@ class Engine:
                 # FIXME #
                 #########
 
+                tic()
+                flashinfer.apply_rope_inplace(
+                    q = q,
+                    k = k,
+                    indptr = indptr_tensor,
+                    offsets = seq_lens_before_t,
+                    rope_theta = 500_000.0,
+                )
+                toc("apply_rope")
+
+
                 # ---- Append new tokens to *paged* KV-cache ------------------
                 # Use flashinfer.get_batch_indices_positions and flashinfer.append_paged_kv_cache
                 # if you use get_batch_indices_positions, seq_lens should be the length after the allocation
@@ -330,6 +422,25 @@ class Engine:
                 #########
                 # FIXME #
                 #########
+                tic()
+                batch_indices, positions = flashinfer.get_batch_indices_positions(
+                    append_indptr = indptr_tensor,
+                    seq_lens = seq_lens_after_t,
+                    nnz = q.size(0),
+                )
+
+                flashinfer.append_paged_kv_cache(
+                    append_key = k,
+                    append_value = v,
+                    batch_indices = batch_indices,
+                    positions = positions,
+                    paged_kv_cache = (self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    kv_indptr = kv_indptr,
+                    kv_indices = kv_indices,
+                    kv_last_page_len = kv_last_page_len,
+                    kv_layout = "HND",
+                )
+                toc("copy_kv_cache")
 
                 # ---- Attention itself --------------------------------------
                 # run prefill and decode wrappers. Note that for the prefill wrapper, if qo_indptr does not start with 0, first qo_indptr[0] rows of the output tensor will be empty
@@ -337,16 +448,42 @@ class Engine:
                 #########
                 # FIXME #
                 #########
+
+                tic()
+                if not len(requests) - num_decode_req == 0:
+                    prefill_q = q[num_decode_tokens:]
+                    prefill_att = self.prefill_wrapper.run(
+                        q=prefill_q,
+                        paged_kv_cache=(self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
+                
+                if not num_decode_req == 0:
+                    decode_q = q[:num_decode_tokens]
+                    decode_att = self.decode_wrapper.run(
+                        q=decode_q,
+                        paged_kv_cache=(self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
+                toc("attention_kernel")
                 
                 # aggregate the decode and prefill outputs
                 #########
                 # FIXME #
-                #########
+                if num_decode_req == 0:
+                    attn_out = prefill_att
+                elif len(requests) - num_decode_req == 0:
+                    attn_out = decode_att
+                else:
+                    attn_out = torch.cat([decode_att, prefill_att], dim=0)
+
+                tic()
+                attn_out = attn_out.view(-1, self.num_qo_heads * self.head_dim)
                 
                 # Residual connection
                 hidden = attn_out.matmul(self.weights["o_proj_weight"][layer].T) + hidden
+                toc("attn_output_proj")
 
                 # === FFN sub-layer ==========================================
+                tic()
                 rms = torch.sqrt(hidden.square().mean(-1, keepdim=True) + 1e-5)
                 ln_ffn_in = (hidden / rms).to(torch.float16) * self.weights["layernormFFN_weight"][layer]
 
@@ -357,19 +494,31 @@ class Engine:
                     .matmul(self.weights["down_proj_weight"][layer].T)
                     + hidden
                 )
+                toc("ffn")
 
             # ----------------------------------------------------------------
             # 6) Final language-model head ----------------------------------
+            tic()
             rms = torch.sqrt(hidden.square().mean(-1, keepdim=True) + 1e-5)
             logits = (
                 (hidden / rms).to(torch.float16) * self.weights["model_layernorm_weight"]
             ).matmul(self.weights["lm_head_weight"].T)
+            toc("lm_head")
 
             sample_ids = torch.argmax(logits, dim=-1)
 
             # Extract *new* token for each request (last token of each row)
             last_token_indices = (indptr_tensor[1:] - 1).long()
-            return sample_ids[last_token_indices].cpu()
+            tic()
+            output = sample_ids[last_token_indices].cpu()
+            toc("output_select")
+
+            if enable_timing:
+                stage_times["total"] = sum(stage_times.values())
+                self.last_run_breakdown = stage_times
+            else:
+                self.last_run_breakdown = {}
+            return output
 
     # ---------------------------------------------------------------------
     #  Full batched *generation* loop (prefill + iterative decode)
@@ -417,6 +566,12 @@ class Engine:
             self.tokenizer.decode(r.output_token_ids, skip_special_tokens=True)
             for r in requests
         ]
+    
+    def reset_cache(self):
+        """Release all allocated pages back to the pool."""
+        for cache in self.kv_cache_map.values():
+            cache.release()
+        self.kv_cache_map.clear()
 
 
 # ---------------------------------------------------------------------------
