@@ -80,10 +80,12 @@ def run_one_iteration(input_ids, rank, world_size):
         # assuming that the weights of q_proj, k_proj, v_proj are split in a column-wise (head) manner
         # hint: use rank, local_q_heads, local_kv_heads, head_dim to figure out the correct slice
         # hint: to debug, compare the intermediate outputs with the original implementation in transformer-w3l1.py
-        
-        # q = 
-        # k = 
-        # v = 
+        q_weight = self_attn_q_proj_weight[layer][rank * local_q_heads * head_dim:(rank + 1) * local_q_heads * head_dim, :]
+        q = x.matmul(q_weight.t())
+        k_weight = self_attn_k_proj_weight[layer][rank * local_kv_heads * head_dim:(rank + 1) * local_kv_heads * head_dim, :]
+        k = x.matmul(k_weight.t())
+        v_weight = self_attn_v_proj_weight[layer][rank * local_kv_heads * head_dim:(rank + 1) * local_kv_heads * head_dim, :]
+        v = x.matmul(v_weight.t())
 
         # Apply rotary position embeddings
         apply_rope(q, output=q, head_dim=head_dim, offset=0)
@@ -111,11 +113,13 @@ def run_one_iteration(input_ids, rank, world_size):
         # TODO: generate the o_proj_local vector
         # assuming that the weights of o_proj are split in a row-wise manner
         # hint: use rank, local_hidden_dim to figure out the correct slice
-        # o_proj_local = 
-        
+        o_proj_weight_slice = o_proj_weight[layer][rank * local_q_heads * head_dim:(rank + 1) * local_q_heads * head_dim, :]
+        o_proj_local = attn_output.matmul(o_proj_weight_slice)
+
         # TODO: perform the all-reduce operation
-        # hint: use dist.all_reduce 
-        
+        # hint: use dist.all_reduce
+        dist.all_reduce(o_proj_local, op=dist.ReduceOp.SUM)
+
         o_proj_residual = o_proj_local + hidden_state  # Add residual
 
         # --- Part 2 Implement the feedforward block ---
