@@ -113,8 +113,8 @@ def run_one_iteration(input_ids, rank, world_size):
         # TODO: generate the o_proj_local vector
         # assuming that the weights of o_proj are split in a row-wise manner
         # hint: use rank, local_hidden_dim to figure out the correct slice
-        o_proj_weight_slice = o_proj_weight[layer][rank * local_q_heads * head_dim:(rank + 1) * local_q_heads * head_dim, :]
-        o_proj_local = attn_output.matmul(o_proj_weight_slice)
+        o_proj_weight_slice = o_proj_weight[layer][:, rank * local_q_heads * head_dim:(rank + 1) * local_q_heads * head_dim]
+        o_proj_local = attn_output.matmul(o_proj_weight_slice.t())
 
         # TODO: perform the all-reduce operation
         # hint: use dist.all_reduce
