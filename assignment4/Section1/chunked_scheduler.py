@@ -6,7 +6,7 @@ class InputRequest:
         self.input_str = input_str
         self.output_len = output_len
         
-class Scheduler:
+class ChunkScheduler:
     def __init__(self, engine: Engine, token_batch_size: int):
         self.engine = engine
         self.token_batch_size = token_batch_size
@@ -21,7 +21,7 @@ class Scheduler:
         self.pending_input_req.append(input_req)
         
     def finished(self) -> bool:
-        return not self.pending_input_req and not self.decode_req and not self.pending_prefill
+        return not self.pending_input_req and not self.decode_req and not self.pending_prefill and not self.scheduled_prefill_req
 
     def get_token_batch_size(self) -> int:
         sum = 0
@@ -31,7 +31,7 @@ class Scheduler:
             sum += 1
         return sum
 
-    def run(self):
+    def run(self, enable_timing: bool = False):
         # Schedule new prefill requests until batch is full or no pending inputs
         
         while self.pending_input_req:
@@ -56,11 +56,40 @@ class Scheduler:
         #########
         # FIXME #
         #########
+        while self.pending_prefill and available_budget > 0:
+            req = self.pending_prefill[0]
+            chunk_size = min(req.remaining_prefill_tokens, available_budget)
+            
+            curr_pos = req.prompt_length - req.remaining_prefill_tokens
+            req.scheduling_pf_tokens = req.prompt_token_ids[curr_pos:curr_pos + chunk_size]
+            req.remaining_prefill_tokens -= chunk_size
+            req.last_chunk = req.remaining_prefill_tokens == 0
+            
+            available_budget -= chunk_size
+            self.scheduled_prefill_req.append(req)
+
+            if req.last_chunk:
+                self.pending_prefill.pop(0)
+            else:
+                break
+
             
         # Build the list of requests to send to the engine
         #########
         # FIXME #
         #########
+        if self.finished():
+            print("No pending requests to schedule or decode.")
+            return
+        
+        request_list_total = self.decode_req + self.scheduled_prefill_req
+        decode_num = len(self.decode_req)
+        new_tokens = self.engine.run(
+            request_list_total,
+            decode_num,
+            enable_timing=enable_timing,
+        )
+
 
         # Append newly generated tokens to each request's output buffer
         # For prefill, only append if this cycle is the last chunk
@@ -68,15 +97,43 @@ class Scheduler:
         # FIXME #
         #########
 
+        for i, req in enumerate(request_list_total):
+            if i < decode_num:
+                req.output_token_ids = torch.cat(
+                    [req.output_token_ids, new_tokens[i:i+1].to(req.output_token_ids.device)],
+                    dim=0
+                )
+            else:
+                if req.last_chunk:
+                    req.output_token_ids = torch.cat(
+                        [req.output_token_ids, new_tokens[i:i+1].to(req.output_token_ids.device)],
+                        dim=0
+                    )
+
+
         # Check which decode requests have finished
         #########
         # FIXME #
         #########
 
+        ongoing_decode: list[Request] = []
+        for req in request_list_total:
+            if req.current_length >= req.output_length + len(req.prompt_token_ids):
+                self.completed.append(req)
+                cache = self.engine.kv_cache_map.pop(req.request_id, None)
+                if cache is not None:
+                    cache.release()
+            else:
+                if req.last_chunk:
+                    ongoing_decode.append(req)
+
+
         # Move scheduled prefill requests into decode queue
         #########
         # FIXME #
         #########
+        self.decode_req = ongoing_decode
+        self.scheduled_prefill_req = []
     
     def print_completed(self):
         for i, req in enumerate(self.completed):

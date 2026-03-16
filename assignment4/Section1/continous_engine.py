@@ -9,7 +9,7 @@ import flashinfer
 from transformers import AutoTokenizer
 
 # ---------------------------------------------------------------------------
-#  Project utilities (local module)
+#  Project ut ilities (local module)
 # ---------------------------------------------------------------------------
 # helper.py must live one directory above this file
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -275,13 +275,40 @@ class Engine:
             # ----------------------------------------------------------------
             # 4) Plan FlashInfer execution for this micro-batch
             # ----------------------------------------------------------------
+
+            num_decode_tokens = indptr_tensor[num_decode_req]  
             if not len(requests) - num_decode_req == 0:
-                pass
+                prefill_qo_indptr = indptr_tensor[num_decode_req:] - num_decode_tokens
+                prefill_kv_indptr = kv_indptr[num_decode_req:] - kv_indptr[num_decode_req]
+                
+                prefill_kv_indices = kv_indices[kv_indptr[num_decode_req]:]
+                
+                self.prefill_wrapper.plan(
+                    qo_indptr=prefill_qo_indptr,
+                    paged_kv_indptr=prefill_kv_indptr,
+                    paged_kv_indices=prefill_kv_indices,
+                    paged_kv_last_page_len=kv_last_page_len[num_decode_req:],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim_qk=self.head_dim,
+                    page_size=self.page_size,
+                    causal=True
+                )
                 #########
                 # FIXME #
                 #########
             if num_decode_req > 0:
-                pass
+                decode_total_pages = kv_indptr[num_decode_req]
+                self.decode_wrapper.plan(
+                    indptr=kv_indptr[:num_decode_req + 1],
+                    indices=kv_indices[:decode_total_pages],
+                    last_page_len=kv_last_page_len[:num_decode_req],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    page_size=self.page_size,
+                    data_type=torch.float16,
+                )
                 #########
                 # FIXME #
                 #########
@@ -351,6 +378,27 @@ class Engine:
                 #########
                 
                 # aggregate the decode and prefill outputs
+                if not len(requests) - num_decode_req == 0:
+                    prefill_q = q[num_decode_tokens:]
+                    prefill_att = self.prefill_wrapper.run(
+                        q=prefill_q,
+                        paged_kv_cache=(self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
+                
+                if not num_decode_req == 0:
+                    decode_q = q[:num_decode_tokens]
+                    decode_att = self.decode_wrapper.run(
+                        q=decode_q,
+                        paged_kv_cache=(self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
+
+                if num_decode_req == 0:
+                    attn_out = prefill_att
+                elif len(requests) - num_decode_req == 0:
+                    attn_out = decode_att
+                else:
+                    attn_out = torch.cat([decode_att, prefill_att], dim=0)
+                attn_out = attn_out.view(attn_out.size(0), -1)  # (T, Hq*D)
                 #########
                 # FIXME #
                 #########      
