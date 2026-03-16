@@ -1,81 +1,115 @@
+#!/usr/bin/env python3
+"""Benchmark: Prefill attention compute utilization, batch=1, varying sequence length p."""
+
+import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+import flashinfer
 
-#Reference config for each model
-llama3_1b_config = {
-    "hidden_size": 2048,
-    "num_attention_heads": 32,
-    "num_key_value_heads": 8
-}
+DEVICE = "cuda"
+DTYPE = torch.float16
+NUM_WARMUP = 10
+NUM_ITERS = 100
 
-llama3_3b_config = {
-    "hidden_size": 3072,
-    "num_attention_heads": 24,
-    "num_key_value_heads": 8
-}
+# Model configurations
+CONFIGS = [
+    {"name": "LLaMA3-1B", "hidden_size": 2048, "num_attention_heads": 32, "num_key_value_heads": 8},
+    {"name": "LLaMA3-3B", "hidden_size": 3072, "num_attention_heads": 24, "num_key_value_heads": 8},
+    {"name": "LLaMA3-8B", "hidden_size": 4096, "num_attention_heads": 32, "num_key_value_heads": 8},
+]
 
-llama3_8b_config = {
-    "hidden_size": 4096,
-    "num_attention_heads": 32,
-    "num_key_value_heads": 8
-}
+BATCH_SIZE = 1
+SEQ_LENGTHS = 2 ** np.arange(7, 16)  # 128 to 32768
 
-# Sequence lengths (powers of 2)
-p_llama3 = 2 ** np.arange(7, 16)   # 2^7 to 2^15
 
-# Fake TFLOPs data generator
-def fake_tflops(seq_lens, model_factor):
-    return np.log2(seq_lens) * model_factor + np.random.normal(0, 0.5, size=len(seq_lens))
+def compute_prefill_flops(batch, num_heads, seq_len, head_dim):
+    """FLOPs for causal attention: halved from full attention (FlashAttention-2 convention)."""
+    return 2 * batch * num_heads * seq_len * seq_len * head_dim
 
-# Generate fake compute utilization data
-llama3_1b_sdpa = fake_tflops(p_llama3, 2.0)
-llama3_1b_flashinfer = fake_tflops(p_llama3, 2.2)
 
-llama3_3b_sdpa = fake_tflops(p_llama3, 2.5)
-llama3_3b_flashinfer = fake_tflops(p_llama3, 2.8)
+def benchmark_fn(fn, num_warmup=NUM_WARMUP, num_iters=NUM_ITERS):
+    """Run fn repeatedly and return average elapsed time in seconds."""
+    for _ in range(num_warmup):
+        fn()
+    torch.cuda.synchronize()
 
-llama3_8b_sdpa = fake_tflops(p_llama3, 3.5)
-llama3_8b_flashinfer = fake_tflops(p_llama3, 3.9)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(num_iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / num_iters / 1000.0
 
-# Plotting setup
-fig, axs = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-models = ['LLaMA3-1B', 'LLaMA3-3B', 'LLaMA3-8B']
 
-# LLaMA2-7B plot
-axs[0].plot(p_llama3, llama3_1b_sdpa, label='PyTorch SDPA', marker='o')
-axs[0].plot(p_llama3, llama3_1b_flashinfer, label='FlashInfer', marker='x')
-axs[0].set_xscale('log', base=2)
-axs[0].set_title(models[0])
-axs[0].set_xlabel('p (sequence length)')
-axs[0].set_ylabel('Compute Utilization (TFLOPs)')
-axs[0].set_xticks(p_llama3)
-axs[0].set_xticklabels([str(p) for p in p_llama3])
-axs[0].legend()
-axs[0].grid(True, which='both')
+def repeat_kv(x, n_rep):
+    """Expand KV heads for SDPA: (B, H_kv, S, D) -> (B, H_kv*n_rep, S, D)."""
+    if n_rep == 1:
+        return x
+    bs, h, s, d = x.shape
+    return x[:, :, None, :, :].expand(bs, h, n_rep, s, d).reshape(bs, h * n_rep, s, d)
 
-# LLaMA3-8B plot
-axs[1].plot(p_llama3, llama3_3b_sdpa, label='PyTorch SDPA', marker='o')
-axs[1].plot(p_llama3, llama3_3b_flashinfer, label='FlashInfer', marker='x')
-axs[1].set_xscale('log', base=2)
-axs[1].set_title(models[1])
-axs[1].set_xlabel('p (sequence length)')
-axs[1].set_xticks(p_llama3)
-axs[1].set_xticklabels([str(p) for p in p_llama3])
-axs[1].legend()
-axs[1].grid(True, which='both')
 
-# LLaMA3-70B plot
-axs[2].plot(p_llama3, llama3_8b_sdpa, label='PyTorch SDPA', marker='o')
-axs[2].plot(p_llama3, llama3_8b_flashinfer, label='FlashInfer', marker='x')
-axs[2].set_xscale('log', base=2)
-axs[2].set_title(models[2])
-axs[2].set_xlabel('p (sequence length)')
-axs[2].set_xticks(p_llama3)
-axs[2].set_xticklabels([str(p) for p in p_llama3])
-axs[2].legend()
-axs[2].grid(True, which='both')
+def main():
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
 
-# Overall figure title and layout
-fig.suptitle('Prefill Attention Compute Utilization (Fake Data)', fontsize=16)
-plt.tight_layout(rect=[0, 0, 1, 0.95])
-plt.savefig('attention_compute_utilization.png', dpi=300)
+    for idx, config in enumerate(CONFIGS):
+        num_heads = config["num_attention_heads"]
+        num_kv_heads = config["num_key_value_heads"]
+        head_dim = config["hidden_size"] // num_heads
+        n_rep = num_heads // num_kv_heads
+
+        sdpa_tflops_list = []
+        fi_tflops_list = []
+
+        for seq_len in SEQ_LENGTHS:
+            seq_len = int(seq_len)
+            flops = compute_prefill_flops(BATCH_SIZE, num_heads, seq_len, head_dim)
+
+            # --- PyTorch SDPA benchmark ---
+            q = torch.randn(BATCH_SIZE, num_heads, seq_len, head_dim, dtype=DTYPE, device=DEVICE)
+            k = torch.randn(BATCH_SIZE, num_kv_heads, seq_len, head_dim, dtype=DTYPE, device=DEVICE)
+            v = torch.randn(BATCH_SIZE, num_kv_heads, seq_len, head_dim, dtype=DTYPE, device=DEVICE)
+            k_exp = repeat_kv(k, n_rep)
+            v_exp = repeat_kv(v, n_rep)
+
+            t = benchmark_fn(lambda: F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True))
+            sdpa_tflops_list.append(flops / t / 1e12)
+
+            del q, k, v, k_exp, v_exp
+            torch.cuda.empty_cache()
+
+            # --- FlashInfer benchmark (single prefill) ---
+            q_fi = torch.randn(seq_len, num_heads, head_dim, dtype=DTYPE, device=DEVICE)
+            k_fi = torch.randn(seq_len, num_kv_heads, head_dim, dtype=DTYPE, device=DEVICE)
+            v_fi = torch.randn(seq_len, num_kv_heads, head_dim, dtype=DTYPE, device=DEVICE)
+
+            t = benchmark_fn(lambda: flashinfer.single_prefill_with_kv_cache(q_fi, k_fi, v_fi, causal=True))
+            fi_tflops_list.append(flops / t / 1e12)
+
+            del q_fi, k_fi, v_fi
+            torch.cuda.empty_cache()
+
+            print(f"  {config['name']}, p={seq_len}: SDPA={sdpa_tflops_list[-1]:.2f}, FlashInfer={fi_tflops_list[-1]:.2f} TFLOPs")
+
+        axs[idx].plot(SEQ_LENGTHS, sdpa_tflops_list, label='PyTorch SDPA', marker='o')
+        axs[idx].plot(SEQ_LENGTHS, fi_tflops_list, label='FlashInfer', marker='x')
+        axs[idx].set_xscale('log', base=2)
+        axs[idx].set_title(config['name'])
+        axs[idx].set_xlabel('p (sequence length)')
+        axs[idx].set_xticks(SEQ_LENGTHS)
+        axs[idx].set_xticklabels([str(int(p)) for p in SEQ_LENGTHS], rotation=45)
+        axs[idx].legend()
+        axs[idx].grid(True, which='both')
+
+    axs[0].set_ylabel('Compute Utilization (TFLOPs)')
+    fig.suptitle('Prefill Attention Compute Utilization (batch=1, varying p)', fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig('prefill_attention_p.png', dpi=300)
+    print("Saved prefill_attention_p.png")
+
+
+if __name__ == '__main__':
+    main()
